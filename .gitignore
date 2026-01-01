@@ -1,0 +1,14 @@
+# Object files
+*.o
+
+# Library archives
+*.a
+
+# Binary executables
+*.bin
+
+# Other build artifacts
+*.map
+*.asm
+*.img
+*.tar
