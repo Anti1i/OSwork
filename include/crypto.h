@@ -11,7 +11,7 @@
 #define _ORANGES_CRYPTO_H_
 
 /* Magic header for encrypted files */
-#define CRYPTO_MAGIC "ENC1"
+#define CRYPTO_MAGIC "ZUC1"  /* Changed to ZUC1 to indicate ZUC encryption */
 #define CRYPTO_MAGIC_LEN 4
 
 /* Key management */

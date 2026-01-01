@@ -1,125 +1,99 @@
 /*************************************************************************//**
  *****************************************************************************
  * @file   crypto.c
- * @brief  Simple encryption/decryption implementation
+ * @brief  Encryption/decryption implementation using ZUC algorithm
  * @author Orange'S Development Team
- * @date   2025
+ * @date   2026
+ *
+ * Changed from simple XOR to ZUC (祖冲之) stream cipher for enhanced security
  *****************************************************************************
  *****************************************************************************/
 
 #include "type.h"
 #include "crypto.h"
+#include "zuc.h"
 #include "string.h"
 #include "stdio.h"
 
-/* Global key storage */
-static unsigned char g_expanded_key[256];
+/* Global ZUC state */
+static zuc_state_t g_zuc_state;
 static int g_key_initialized = 0;
 
 /**
- * @brief Simple PRNG for key expansion
- */
-static unsigned int prng_state = 0x12345678;
-
-static unsigned int simple_rand() {
-    prng_state = prng_state * 1103515245 + 12345;
-    return (prng_state / 65536) % 32768;
-}
-
-static void simple_srand(unsigned int seed) {
-    prng_state = seed;
-}
-
-/**
- * @brief Generate expanded key from password
+ * @brief Generate expanded key from password (kept for compatibility)
+ * Note: This is now primarily used for legacy support
  */
 PUBLIC int crypto_expand_key(const char* password, int pass_len, unsigned char* key_out) {
-    int i, j;
-    unsigned int seed = 0;
+    int i;
 
     if (pass_len < MIN_KEY_LEN || pass_len > MAX_KEY_LEN) {
         return -1;
     }
 
-    /* Calculate seed from password */
-    for (i = 0; i < pass_len; i++) {
-        seed = seed * 31 + (unsigned char)password[i];
-    }
-
-    simple_srand(seed);
-
-    /* Generate 256-byte expanded key */
+    /* Simple expansion: repeat password to fill 256 bytes */
     for (i = 0; i < 256; i++) {
-        /* Mix password characters with pseudo-random values */
-        key_out[i] = (unsigned char)(simple_rand() ^ password[i % pass_len]);
-
-        /* Additional mixing */
-        for (j = 0; j < i % 3; j++) {
-            key_out[i] = (key_out[i] + password[j % pass_len]) & 0xFF;
-        }
+        key_out[i] = (unsigned char)password[i % pass_len];
     }
 
     return 0;
 }
 
 /**
- * @brief Initialize the crypto system with a key
+ * @brief Initialize the crypto system with a key (using ZUC)
  */
 PUBLIC int crypto_init(const char* key, int key_len) {
-    if (crypto_expand_key(key, key_len, g_expanded_key) != 0) {
+    if (key_len < MIN_KEY_LEN || key_len > MAX_KEY_LEN) {
         return -1;
     }
+
+    /* Initialize ZUC with password-based key derivation */
+    zuc_init_with_password(&g_zuc_state, key, key_len);
 
     g_key_initialized = 1;
     return 0;
 }
 
 /**
- * @brief Encrypt data in-place using simple XOR + CBC
+ * @brief Encrypt data in-place using ZUC stream cipher
  */
 PUBLIC int crypto_encrypt(char* data, int len) {
-    int i;
-    unsigned char prev = 0x5A; /* Initial vector */
+    zuc_state_t temp_state;
 
     if (!g_key_initialized) {
         return -1;
     }
 
-    for (i = 0; i < len; i++) {
-        /* Simple encryption: XOR with key and previous byte (CBC) */
-        unsigned char key_byte = g_expanded_key[i % 256];
+    /* Create a copy of state for encryption (to allow re-initialization) */
+    memcpy(&temp_state, &g_zuc_state, sizeof(zuc_state_t));
 
-        /* XOR with key and previous byte only (no position factor) */
-        unsigned char encrypted = (unsigned char)data[i] ^ key_byte ^ prev;
+    /* Re-initialize with same key for fresh keystream */
+    zuc_init(&temp_state, g_zuc_state.key, g_zuc_state.iv);
 
-        prev = encrypted;
-        data[i] = (char)encrypted;
-    }
+    /* Encrypt using ZUC */
+    zuc_crypt(&temp_state, (unsigned char*)data, (unsigned char*)data, len);
 
     return 0;
 }
 
 /**
- * @brief Decrypt data in-place
+ * @brief Decrypt data in-place using ZUC stream cipher
+ * Note: For stream ciphers, encryption and decryption are the same operation
  */
 PUBLIC int crypto_decrypt(char* data, int len) {
-    int i;
-    unsigned char prev = 0x5A; /* Same initial vector */
+    zuc_state_t temp_state;
 
     if (!g_key_initialized) {
         return -1;
     }
 
-    for (i = 0; i < len; i++) {
-        unsigned char key_byte = g_expanded_key[i % 256];
+    /* Create a copy of state for decryption */
+    memcpy(&temp_state, &g_zuc_state, sizeof(zuc_state_t));
 
-        /* Reverse the encryption (no position factor) */
-        unsigned char encrypted = (unsigned char)data[i];
-        unsigned char decrypted = encrypted ^ key_byte ^ prev;
+    /* Re-initialize with same key for fresh keystream */
+    zuc_init(&temp_state, g_zuc_state.key, g_zuc_state.iv);
 
-        prev = encrypted;
-        data[i] = (char)decrypted;
-    }
+    /* Decrypt using ZUC (same as encryption for stream cipher) */
+    zuc_crypt(&temp_state, (unsigned char*)data, (unsigned char*)data, len);
 
     return 0;
 }
