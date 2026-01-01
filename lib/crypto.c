@@ -281,7 +281,7 @@ PUBLIC int crypto_encrypt(char* data, int len) {
     unsigned char iv[16];
     unsigned char key[16];
     unsigned int keystream_word;
-    unsigned char *keystream_bytes = (unsigned char*)&keystream_word;
+    unsigned char keystream_bytes[4];
 
     if (!g_key_initialized) {
         return -1;
@@ -308,6 +308,12 @@ PUBLIC int crypto_encrypt(char* data, int len) {
         /* Generate 4 bytes of keystream */
         keystream_word = ZUC_GenerateKeyword();
 
+        /* Extract bytes in big-endian order for consistent behavior */
+        keystream_bytes[0] = (keystream_word >> 24) & 0xFF;
+        keystream_bytes[1] = (keystream_word >> 16) & 0xFF;
+        keystream_bytes[2] = (keystream_word >> 8) & 0xFF;
+        keystream_bytes[3] = keystream_word & 0xFF;
+
         /* XOR with plaintext */
         for (j = 0; j < 4 && (i + j) < len; j++) {
             data[i + j] ^= keystream_bytes[j];
@@ -325,7 +331,7 @@ PUBLIC int crypto_decrypt(char* data, int len) {
     unsigned char iv[16];
     unsigned char key[16];
     unsigned int keystream_word;
-    unsigned char *keystream_bytes = (unsigned char*)&keystream_word;
+    unsigned char keystream_bytes[4];
 
     if (!g_key_initialized) {
         return -1;
@@ -351,6 +357,12 @@ PUBLIC int crypto_decrypt(char* data, int len) {
     for (i = 0; i < len; i += 4) {
         /* Generate 4 bytes of keystream */
         keystream_word = ZUC_GenerateKeyword();
+
+        /* Extract bytes in big-endian order for consistent behavior */
+        keystream_bytes[0] = (keystream_word >> 24) & 0xFF;
+        keystream_bytes[1] = (keystream_word >> 16) & 0xFF;
+        keystream_bytes[2] = (keystream_word >> 8) & 0xFF;
+        keystream_bytes[3] = keystream_word & 0xFF;
 
         /* XOR with ciphertext */
         for (j = 0; j < 4 && (i + j) < len; j++) {
