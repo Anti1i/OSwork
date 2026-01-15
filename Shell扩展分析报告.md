@@ -521,9 +521,827 @@ search_dir.o: search_dir.c
 	$(CC) $(CFLAGS) -o $@ $<
 ```
 
-### 3.3 扩展Shell支持多任务并发执行
+### 3.3 编写`cat`程序（高级文件读写）
 
-#### 3.3.1 原Shell流程图
+#### 3.3.1 需求分析
+
+`cat`命令是类Unix系统中最常用的文件处理工具之一。在本实现中，cat程序被设计为一个功能丰富的文件操作工具，支持以下功能：
+
+**基本文件操作：**
+- 显示完整文件内容
+- 显示文件前N行（head功能）
+- 显示文件后N行（tail功能）
+- 向文件末尾追加内容（append）
+- 向文件开头插入内容（prepend）
+
+**高级加密功能：**
+- 文件加密（使用密钥文件）
+- 文件解密并显示
+- 向加密文件追加内容
+- 向加密文件开头插入内容
+
+这些功能充分利用了OrangeS提供的`open()`、`read()`、`write()`、`lseek()`等系统调用。
+
+#### 3.3.2 加密模块设计
+
+##### 加密算法原理
+
+采用 **XOR + CBC模式** 的简单对称加密算法：
+
+```
+算法流程:
+1. 密钥扩展: 用户密码 → 256字节扩展密钥
+2. 初始向量: IV = 0x5A
+3. 加密循环:
+   对每个字节i:
+     key_byte = expanded_key[i % 256]
+     encrypted[i] = plaintext[i] XOR key_byte XOR prev_byte
+     prev_byte = encrypted[i]
+```
+
+**CBC模式（Cipher Block Chaining）**：
+- 当前块的密文依赖于前一块的密文
+- 相同的明文块会产生不同的密文块
+- 增加破解难度
+
+##### 密钥扩展算法
+
+将短密码扩展为256字节的密钥流：
+
+```c
+int crypto_expand_key(const char* password, int pass_len, unsigned char* key_out) {
+    // 1. 从密码计算种子
+    unsigned int seed = 0;
+    for (i = 0; i < pass_len; i++) {
+        seed = seed * 31 + (unsigned char)password[i];
+    }
+
+    simple_srand(seed);
+
+    // 2. 生成256字节扩展密钥
+    for (i = 0; i < 256; i++) {
+        // 伪随机数 XOR 密码字符
+        key_out[i] = (unsigned char)(simple_rand() ^ password[i % pass_len]);
+
+        // 额外混合
+        for (j = 0; j < i % 3; j++) {
+            key_out[i] = (key_out[i] + password[j % pass_len]) & 0xFF;
+        }
+    }
+
+    return 0;
+}
+```
+
+**设计特点：**
+- 使用线性同余生成器（LCG）作为PRNG
+- 密码的每个字符都会影响整个密钥流
+- 额外混合步骤增强密钥强度
+
+##### 加密文件格式
+
+加密文件包含头部和加密数据两部分：
+
+```
++-------------------------+
+| Crypto Header (12 Bytes)|
+|  - magic: "ENC1" (4B)  |
+|  - original_size (4B)  |
+|  - checksum (4B)       |
++-------------------------+
+| Encrypted Data          |
+| (original_size bytes)   |
++-------------------------+
+```
+
+**数据结构定义：**
+```c
+struct crypto_header {
+    char magic[4];        /* "ENC1" 魔数 */
+    int original_size;    /* 原始文件大小 */
+    int checksum;         /* 明文校验和 */
+};
+```
+
+##### 校验和算法
+
+用于验证解密是否成功（密钥正确性）：
+
+```c
+int crypto_checksum(const char* data, int len) {
+    int sum = 0;
+    for (i = 0; i < len; i++) {
+        sum += (unsigned char)data[i];
+        sum = (sum * 31) & 0xFFFFFF;  // 保持在合理范围
+    }
+    return sum;
+}
+```
+
+**注意事项：**
+- 校验和基于**明文**计算，而非密文
+- 解密后重新计算校验和，与头部中的值比对
+- 不匹配说明密钥错误或文件损坏
+
+#### 3.3.3 基本文件操作实现
+
+##### 1. 完整文件显示
+
+最简单的cat功能，读取并显示整个文件：
+
+```c
+int print_file(const char* filename) {
+    int fd = open(filename, O_RDWR);
+    if (fd == -1) {
+        printf("cat: cannot open file '%s'\n", filename);
+        return -1;
+    }
+
+    char buffer[BUFFER_SIZE];  // 4096字节缓冲区
+    int bytes_read;
+
+    // 循环读取直到文件结束
+    while ((bytes_read = read(fd, buffer, BUFFER_SIZE)) > 0) {
+        for (int i = 0; i < bytes_read; i++) {
+            printf("%c", buffer[i]);
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+```
+
+##### 2. Head功能（前N行）
+
+打印文件的前N行：
+
+```c
+int print_head(const char* filename, int n) {
+    int fd = open(filename, O_RDWR);
+    if (fd == -1) return -1;
+
+    char buffer[BUFFER_SIZE];
+    int bytes_read;
+    int lines_printed = 0;
+
+    while ((bytes_read = read(fd, buffer, BUFFER_SIZE)) > 0
+           && lines_printed < n) {
+        for (int i = 0; i < bytes_read && lines_printed < n; i++) {
+            printf("%c", buffer[i]);
+            if (buffer[i] == '\n') {
+                lines_printed++;
+            }
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+```
+
+**关键点：**
+- 统计换行符`\n`的数量
+- 达到N行后立即停止读取
+- 避免读取整个大文件
+
+##### 3. Tail功能（后N行）
+
+打印文件的后N行（需要读取整个文件）：
+
+```c
+int print_tail(const char* filename, int n) {
+    int fd = open(filename, O_RDWR);
+    if (fd == -1) return -1;
+
+    char buffer[BUFFER_SIZE];
+    int total_bytes = 0;
+    int bytes_read;
+
+    // 读取整个文件到缓冲区
+    while ((bytes_read = read(fd, buffer + total_bytes,
+                               BUFFER_SIZE - total_bytes)) > 0) {
+        total_bytes += bytes_read;
+        if (total_bytes >= BUFFER_SIZE - 1) {
+            printf("cat: file too large for tail operation\n");
+            close(fd);
+            return -1;
+        }
+    }
+
+    // 从后向前统计换行符
+    int newline_count = 0;
+    int start_pos = total_bytes - 1;
+
+    for (int i = total_bytes - 1; i >= 0; i--) {
+        if (buffer[i] == '\n') {
+            newline_count++;
+            if (newline_count == n) {
+                start_pos = i + 1;
+                break;
+            }
+        }
+        if (i == 0 && newline_count < n) {
+            start_pos = 0;  // 文件不足N行
+        }
+    }
+
+    // 打印从start_pos到文件末尾
+    for (int i = start_pos; i < total_bytes; i++) {
+        printf("%c", buffer[i]);
+    }
+
+    close(fd);
+    return 0;
+}
+```
+
+**限制：**
+- 文件大小不能超过`BUFFER_SIZE`（4096字节）
+- 适合小文件的tail操作
+
+##### 4. Append追加文本
+
+向文件末尾追加一行文本：
+
+```c
+int append_text(const char* filename, const char* text) {
+    int fd = open(filename, O_RDWR);
+    if (fd == -1) {
+        // 文件不存在则创建
+        fd = open(filename, O_CREAT | O_RDWR);
+        if (fd == -1) {
+            printf("cat: cannot create file '%s'\n", filename);
+            return -1;
+        }
+    }
+
+    // 移动文件指针到末尾
+    lseek(fd, 0, SEEK_END);
+
+    int text_len = strlen(text);
+    int bytes_written = write(fd, text, text_len);
+
+    if (bytes_written != text_len) {
+        printf("cat: write failed\n");
+        close(fd);
+        return -1;
+    }
+
+    write(fd, "\n", 1);  // 添加换行符
+    close(fd);
+    printf("cat: text appended to '%s'\n", filename);
+    return 0;
+}
+```
+
+**关键系统调用：**
+- `lseek(fd, 0, SEEK_END)`：定位到文件末尾
+- `write()`：写入新内容
+
+##### 5. Prepend前置插入
+
+向文件开头插入文本（需要重写整个文件）：
+
+```c
+int prepend_text(const char* filename, const char* text) {
+    int fd = open(filename, O_RDWR);
+    if (fd == -1) {
+        // 如果文件不存在，直接创建并写入
+        fd = open(filename, O_CREAT | O_RDWR);
+        write(fd, text, strlen(text));
+        write(fd, "\n", 1);
+        close(fd);
+        return 0;
+    }
+
+    // 读取原文件内容
+    char buffer[BUFFER_SIZE];
+    int bytes_read = read(fd, buffer, BUFFER_SIZE);
+
+    if (bytes_read == -1) {
+        printf("cat: read failed\n");
+        close(fd);
+        return -1;
+    }
+
+    // 关闭并以截断模式重新打开
+    close(fd);
+    fd = open(filename, O_RDWR | O_TRUNC);
+    if (fd == -1) {
+        printf("cat: cannot reopen file '%s'\n", filename);
+        return -1;
+    }
+
+    // 先写入新文本
+    write(fd, text, strlen(text));
+    write(fd, "\n", 1);
+
+    // 再写入原内容
+    if (bytes_read > 0) {
+        write(fd, buffer, bytes_read);
+    }
+
+    close(fd);
+    printf("cat: text prepended to '%s'\n", filename);
+    return 0;
+}
+```
+
+**实现策略：**
+1. 读取原文件内容到缓冲区
+2. 以`O_TRUNC`模式打开文件（清空原内容）
+3. 先写入新文本
+4. 再写入原内容
+
+**局限性：**
+- 需要将整个文件读入内存
+- 不适合大文件
+
+#### 3.3.4 加密功能实现
+
+##### 1. 文件加密
+
+将明文文件加密：
+
+```c
+int encrypt_file(const char* keyfile, const char* filename) {
+    // 从密钥文件初始化加密系统
+    if (crypto_init_from_file(keyfile) != 0) {
+        printf("cat: cannot read key from '%s'\n", keyfile);
+        return -1;
+    }
+
+    // 读取原文件
+    int fd = open(filename, O_RDWR);
+    if (fd == -1) {
+        printf("cat: cannot open file '%s'\n", filename);
+        return -1;
+    }
+
+    char buffer[BUFFER_SIZE];
+    int bytes_read = read(fd, buffer, BUFFER_SIZE - sizeof(struct crypto_header));
+
+    if (bytes_read <= 0) {
+        printf("cat: empty file\n");
+        close(fd);
+        return -1;
+    }
+
+    // 检查是否已加密（避免重复加密）
+    if (crypto_is_encrypted(buffer)) {
+        printf("cat: file is already encrypted\n");
+        close(fd);
+        return -1;
+    }
+
+    // ⚠️ 关键：先计算明文校验和（加密前！）
+    int checksum = crypto_checksum(buffer, bytes_read);
+
+    // 加密数据（原地加密）
+    crypto_encrypt(buffer, bytes_read);
+
+    // 创建加密头部
+    struct crypto_header header;
+    header.magic[0] = 'E';
+    header.magic[1] = 'N';
+    header.magic[2] = 'C';
+    header.magic[3] = '1';
+    header.original_size = bytes_read;
+    header.checksum = checksum;  // 存储明文校验和
+
+    // 写回文件
+    close(fd);
+    fd = open(filename, O_RDWR | O_TRUNC);
+    if (fd == -1) {
+        printf("cat: cannot reopen file\n");
+        return -1;
+    }
+
+    write(fd, &header, sizeof(header));  // 写入头部
+    write(fd, buffer, bytes_read);       // 写入密文
+
+    close(fd);
+    printf("cat: file '%s' encrypted successfully (%d bytes)\n",
+           filename, bytes_read);
+    return 0;
+}
+```
+
+**加密流程图：**
+```
+明文文件
+   ↓ 读取
+内存缓冲区
+   ↓ 计算校验和
+checksum (明文)
+   ↓ XOR+CBC加密
+密文缓冲区
+   ↓ 添加头部
+[Header|密文]
+   ↓ 写回文件
+加密文件
+```
+
+##### 2. 文件解密
+
+解密并显示文件内容：
+
+```c
+int decrypt_file(const char* keyfile, const char* filename) {
+    // 初始化密钥
+    if (crypto_init_from_file(keyfile) != 0) {
+        printf("cat: cannot read key from '%s'\n", keyfile);
+        return -1;
+    }
+
+    int fd = open(filename, O_RDWR);
+    if (fd == -1) {
+        printf("cat: cannot open file '%s'\n", filename);
+        return -1;
+    }
+
+    // 读取加密头部
+    struct crypto_header header;
+    int bytes_read = read(fd, &header, sizeof(header));
+
+    if (bytes_read != sizeof(header)) {
+        printf("cat: invalid file format\n");
+        close(fd);
+        return -1;
+    }
+
+    // 验证魔数
+    if (!crypto_is_encrypted(header.magic)) {
+        printf("cat: file is not encrypted\n");
+        close(fd);
+        return -1;
+    }
+
+    // 读取密文数据
+    char buffer[BUFFER_SIZE];
+    bytes_read = read(fd, buffer, header.original_size);
+
+    if (bytes_read != header.original_size) {
+        printf("cat: file corrupted\n");
+        close(fd);
+        return -1;
+    }
+
+    // 解密数据
+    crypto_decrypt(buffer, bytes_read);
+
+    // ⚠️ 关键：验证解密后的明文校验和
+    int checksum = crypto_checksum(buffer, bytes_read);
+    if (checksum != header.checksum) {
+        printf("cat: decryption failed (wrong key or corrupted file)\n");
+        close(fd);
+        return -1;
+    }
+
+    // 显示解密内容
+    for (int i = 0; i < bytes_read; i++) {
+        printf("%c", buffer[i]);
+    }
+
+    close(fd);
+    return 0;
+}
+```
+
+**解密验证机制：**
+1. 魔数验证：确认文件是加密文件
+2. 大小验证：读取的字节数与头部记录一致
+3. 校验和验证：解密后的明文校验和与头部一致
+
+如果校验和不匹配，说明：
+- 密钥错误
+- 文件已损坏
+- 密文被篡改
+
+##### 3. 加密文件追加
+
+向加密文件末尾追加内容：
+
+```c
+int encrypt_append(const char* keyfile, const char* text, const char* filename) {
+    if (crypto_init_from_file(keyfile) != 0) return -1;
+
+    // 1. 读取并解密原文件
+    int fd = open(filename, O_RDWR);
+    struct crypto_header header;
+    read(fd, &header, sizeof(header));
+
+    if (!crypto_is_encrypted(header.magic)) {
+        printf("cat: file is not encrypted\n");
+        close(fd);
+        return -1;
+    }
+
+    char buffer[BUFFER_SIZE];
+    int bytes_read = read(fd, buffer, header.original_size);
+    crypto_decrypt(buffer, bytes_read);
+
+    // 2. 追加新文本到明文
+    int text_len = strlen(text);
+    buffer[bytes_read++] = '\n';
+    for (int i = 0; i < text_len && bytes_read < BUFFER_SIZE; i++) {
+        buffer[bytes_read++] = text[i];
+    }
+
+    // 3. 计算新的明文校验和
+    int checksum = crypto_checksum(buffer, bytes_read);
+
+    // 4. 重新加密
+    crypto_encrypt(buffer, bytes_read);
+
+    // 5. 更新头部并写回
+    header.original_size = bytes_read;
+    header.checksum = checksum;
+
+    close(fd);
+    fd = open(filename, O_RDWR | O_TRUNC);
+    write(fd, &header, sizeof(header));
+    write(fd, buffer, bytes_read);
+
+    close(fd);
+    printf("cat: text appended to encrypted file\n");
+    return 0;
+}
+```
+
+**操作流程：**
+```
+加密文件
+   ↓ 解密
+明文 + 新文本
+   ↓ 重新计算校验和
+   ↓ 重新加密
+新加密文件
+```
+
+##### 4. 加密文件前置插入
+
+向加密文件开头插入内容：
+
+```c
+int encrypt_prepend(const char* keyfile, const char* text, const char* filename) {
+    if (crypto_init_from_file(keyfile) != 0) return -1;
+
+    int fd = open(filename, O_RDWR);
+    struct crypto_header header;
+    read(fd, &header, sizeof(header));
+
+    if (!crypto_is_encrypted(header.magic)) {
+        printf("cat: file is not encrypted\n");
+        close(fd);
+        return -1;
+    }
+
+    // 解密原文件
+    char buffer[BUFFER_SIZE];
+    char temp[BUFFER_SIZE];
+    int bytes_read = read(fd, buffer, header.original_size);
+    crypto_decrypt(buffer, bytes_read);
+
+    // 插入文本到开头
+    int text_len = strlen(text);
+    int new_size = 0;
+
+    // 先写入新文本
+    for (int i = 0; i < text_len; i++) {
+        temp[new_size++] = text[i];
+    }
+    temp[new_size++] = '\n';
+
+    // 再写入原内容
+    for (int i = 0; i < bytes_read && new_size < BUFFER_SIZE; i++) {
+        temp[new_size++] = buffer[i];
+    }
+
+    // 计算明文校验和
+    int checksum = crypto_checksum(temp, new_size);
+
+    // 加密新内容
+    crypto_encrypt(temp, new_size);
+
+    // 更新头部
+    header.original_size = new_size;
+    header.checksum = checksum;
+
+    // 写回文件
+    close(fd);
+    fd = open(filename, O_RDWR | O_TRUNC);
+    write(fd, &header, sizeof(header));
+    write(fd, temp, new_size);
+
+    close(fd);
+    printf("cat: text prepended to encrypted file\n");
+    return 0;
+}
+```
+
+#### 3.3.5 命令行接口设计
+
+cat程序支持多种命令行格式：
+
+```bash
+# 基本操作
+cat <filename>              # 显示整个文件
+cat -h <n> <filename>       # 显示前n行
+cat -t <n> <filename>       # 显示后n行
+cat -a <text> <filename>    # 追加文本
+cat -p <text> <filename>    # 前置插入文本
+
+# 加密操作
+cat -E <keyfile> <filename>         # 加密文件
+cat -D <keyfile> <filename>         # 解密并显示
+cat -ea <keyfile> <text> <file>     # 向加密文件追加
+cat -ep <keyfile> <text> <file>     # 向加密文件前置插入
+```
+
+**参数解析实现：**
+
+```c
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        print_usage();
+        return 0;
+    }
+
+    // cat <filename> - 打印整个文件
+    if (argc == 2) {
+        return print_file(argv[1]);
+    }
+
+    if (argc < 3) {
+        print_usage();
+        return -1;
+    }
+
+    const char* option = argv[1];
+
+    // 基本操作
+    if (strcmp(option, "-h") == 0 && argc == 4) {
+        return print_head(argv[3], str_to_int(argv[2]));
+    }
+
+    if (strcmp(option, "-t") == 0 && argc == 4) {
+        return print_tail(argv[3], str_to_int(argv[2]));
+    }
+
+    if (strcmp(option, "-a") == 0 && argc == 4) {
+        return append_text(argv[3], argv[2]);
+    }
+
+    if (strcmp(option, "-p") == 0 && argc == 4) {
+        return prepend_text(argv[3], argv[2]);
+    }
+
+    // 加密操作
+    if (strcmp(option, "-E") == 0 && argc == 4) {
+        return encrypt_file(argv[2], argv[3]);
+    }
+
+    if (strcmp(option, "-D") == 0 && argc == 4) {
+        return decrypt_file(argv[2], argv[3]);
+    }
+
+    if (strcmp(option, "-ea") == 0 && argc == 5) {
+        return encrypt_append(argv[2], argv[3], argv[4]);
+    }
+
+    if (strcmp(option, "-ep") == 0 && argc == 5) {
+        return encrypt_prepend(argv[2], argv[3], argv[4]);
+    }
+
+    // 未知选项
+    printf("cat: unknown option or invalid arguments\n");
+    print_usage();
+    return -1;
+}
+```
+
+#### 3.3.6 编译配置
+
+**command/Makefile**：
+
+```makefile
+cat.o: cat.c ../include/type.h ../include/stdio.h ../include/crypto.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+cat: cat.o start.o $(LIB)
+	$(LD) $(LDFLAGS) -o $@ $?
+```
+
+**lib/Makefile** （添加crypto库）：
+
+```makefile
+crypto.o: crypto.c ../include/type.h ../include/crypto.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+# 添加到LIB目标
+LIB = lib.a
+LIBOBJS = ... crypto.o ...
+
+$(LIB): $(LIBOBJS)
+	$(AR) rcs $@ $^
+```
+
+#### 3.3.7 使用示例
+
+##### 示例1：基本文件操作
+
+```bash
+# 创建一个文本文件
+$ cat -a "Hello World" test.txt
+cat: text appended to 'test.txt'
+
+$ cat -a "This is line 2" test.txt
+cat: text appended to 'test.txt'
+
+# 显示文件内容
+$ cat test.txt
+Hello World
+This is line 2
+
+# 显示前1行
+$ cat -h 1 test.txt
+Hello World
+```
+
+##### 示例2：加密文件
+
+```bash
+# 创建密钥文件
+$ cat -a "my_secret_key_123" keyfile
+cat: text appended to 'keyfile'
+
+# 创建明文文件
+$ cat -a "Confidential data" secret.txt
+cat: text appended to 'secret.txt'
+
+# 加密文件
+$ cat -E keyfile secret.txt
+cat: file 'secret.txt' encrypted successfully (17 bytes)
+
+# 尝试直接查看（显示乱码）
+$ cat secret.txt
+ENC1<乱码数据...>
+
+# 使用正确密钥解密
+$ cat -D keyfile secret.txt
+Confidential data
+
+# 使用错误密钥解密
+$ cat -D wrong_key secret.txt
+cat: decryption failed (wrong key or corrupted file)
+```
+
+##### 示例3：加密文件编辑
+
+```bash
+# 向加密文件追加内容
+$ cat -ea keyfile "Another secret" secret.txt
+cat: text appended to encrypted file
+
+# 解密查看
+$ cat -D keyfile secret.txt
+Confidential data
+Another secret
+```
+
+#### 3.3.8 技术亮点
+
+1. **内存高效**：使用4KB缓冲区，避免大内存占用
+2. **原地加密**：加密/解密在同一缓冲区进行，节省内存
+3. **完整性校验**：通过校验和验证解密正确性
+4. **防重复加密**：检查魔数，避免对已加密文件再次加密
+5. **错误处理完善**：对文件操作的每个步骤进行错误检查
+6. **用户友好**：提供详细的使用帮助和错误提示
+
+#### 3.3.9 安全性分析
+
+**加密强度：**
+- ✅ 使用CBC模式，相同明文产生不同密文
+- ✅ 256字节密钥流，增加破解难度
+- ⚠️ XOR算法相对简单，不适合高安全场景
+- ⚠️ 线性同余PRNG可预测性较强
+
+**建议改进：**
+- 使用AES等强加密算法
+- 采用密码学安全的PRNG（如Fortuna）
+- 增加密钥派生函数（PBKDF2）
+- 添加消息认证码（HMAC）防篡改
+
+**适用场景：**
+- ✅ 教学演示：展示加密原理
+- ✅ 简单保护：防止普通用户查看
+- ❌ 不适合：敏感信息、网络传输
+
+### 3.4 扩展Shell支持多任务并发执行
+
+#### 3.4.1 原Shell流程图
 
 原始Shell的执行流程：
 
@@ -563,7 +1381,7 @@ search_dir.o: search_dir.c
 
 **问题：** 原Shell每次只能执行一个命令，必须等待该命令执行完毕才能执行下一个命令。
 
-#### 3.3.2 并发执行设计
+#### 3.4.2 并发执行设计
 
 **目标：** 支持使用`&`符号分隔多个命令，实现并发执行。
 
@@ -610,7 +1428,7 @@ $ cmd1 arg1 & cmd2 arg2 & cmd3 arg3
 └─────────────┘
 ```
 
-#### 3.3.3 实现代码
+#### 3.4.3 实现代码
 
 **kernel/main.c** （修改`shabby_shell`函数）
 
@@ -734,7 +1552,7 @@ void shabby_shell(const char* tty_name) {
 }
 ```
 
-#### 3.3.4 关键技术点
+#### 3.4.4 关键技术点
 
 **1. 原子化fork操作**
 
@@ -770,9 +1588,9 @@ int pid = fork();
 - 参数数组：使用`PROC_ORIGIN_STACK`宏定义大小，与进程栈大小一致
 - 防止溢出：在分割字符串时检查边界
 
-### 3.4 进程管理命令实现
+### 3.5 进程管理命令实现
 
-#### 3.4.1 `ps`命令（进程列表）
+#### 3.5.1 `ps`命令（进程列表）
 
 **设计思路：**
 - 读取系统进程表
@@ -810,7 +1628,7 @@ PUBLIC int get_procs(struct proc_info* buf, int max_count) {
 }
 ```
 
-#### 3.4.2 扩展`rm -K`命令（进程终止）
+#### 3.5.2 扩展`rm -K`命令（进程终止）
 
 **设计思路：**
 - 通过进程名或PID终止指定进程
